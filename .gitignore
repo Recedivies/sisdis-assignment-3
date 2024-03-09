@@ -1,0 +1,5 @@
+/experiment/
+/.idea/
+/logs/node*
+/persistent/
+
