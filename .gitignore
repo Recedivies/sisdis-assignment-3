@@ -3,3 +3,4 @@
 /logs/node*
 /persistent/
 
+*/__pycache__/*
