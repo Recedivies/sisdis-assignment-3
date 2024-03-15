@@ -46,11 +46,15 @@ class Raft:
         logging.info("Initialise persistent variable...")
         self.current_term = 0
         self.voted_for = None
+        self.log = []
+        self.commit_length = 0
 
         logging.info("Initialise volatile state...")
         self.current_role: State = State.FOLLOWER
         self.current_leader = None
         self.votes_received = set()
+        self.sent_length = dict()
+        self.acked_length = dict()
 
         logging.info("Initialise flag variable...")
         self.is_stop_timer = False
@@ -72,13 +76,14 @@ class Raft:
 
     def send_message(self, message, port):
         tcp_client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        logging.info(f"message: {message}")
         message = message.encode("UTF-8")
         addr = ("127.0.0.1", port)
 
         try:
             tcp_client_socket.connect(addr)
+            logging.info("Send the message")
             tcp_client_socket.sendall(message)
-            # status_dictionary_node = tcp_client_socket.recv(1024).decode("UTF-8")
         except ConnectionRefusedError as e:
             logging.info(f"Node {node_ports[port]} refused connection...")
 
@@ -86,26 +91,32 @@ class Raft:
         self.current_term += 1
         self.current_role = State.CANDIDATE
         self.voted_for = self.node_id
+        self.votes_received.clear()
         self.votes_received.add(self.node_id)
 
-        message = ("vote_request", self.node_id, self.current_term)
+        last_term = 0
+        if len(self.log) > 0:
+            last_term = self.log[len(self.log) - 1][1]
+
         thread = threading.Thread(target=self.start_election_timer)
         thread.name = "vote_request->election_timer"
         thread.start()
 
+        message = (
+            "vote_request",
+            self.node_id,
+            self.current_term,
+            len(self.log),
+            last_term,
+        )
         for neighbor_port in self.neighbors_ports:
             neighbor_id = node_ports[neighbor_port]
             if neighbor_id == self.node_id:
                 continue
 
-            # thread = threading.Thread(
-            #     target=self.send_message, args=(f"{message}", neighbor_port)
-            # )
-            # thread.name = f"sending_thread-node{neighbor_id}"
-            # thread.start()
             self.send_message(f"{message}", neighbor_port)
 
-    def receive_vote_request(self, c_id: int, c_term: int):
+    def receive_vote_request(self, c_id: int, c_term: int, c_log_length, c_log_term):
         self.is_stop_timer = True
         self.election_timer.cancel()
         self.start_election_timer()
@@ -119,7 +130,15 @@ class Raft:
             self.current_role = State.FOLLOWER
             self.voted_for = None
 
-        if c_term == self.current_term and self.voted_for in {c_id, None}:
+        last_term = 0
+        if len(self.log) > 0:
+            last_term = self.log[len(self.log) - 1][1]
+
+        log_ok = (c_log_term > last_term) or (
+            c_log_term == last_term and c_log_length >= len(self.log)
+        )
+
+        if c_term == self.current_term and log_ok and self.voted_for in {c_id, None}:
             self.voted_for = c_id
             message = ("vote_response", self.node_id, self.current_term, True)
         else:
@@ -138,12 +157,22 @@ class Raft:
             and granted
         ):
             self.votes_received.add(voter_id)
-            if len(self.votes_received) >= self.ceil(Raft.nodes + 1, 2):
+            if len(self.votes_received) >= self.ceil(Raft.nodes, 2):
                 self.current_role = State.LEADER
                 self.current_leader = self.node_id
 
                 self.is_stop_timer = True
                 self.election_timer.cancel()
+
+                for follower_port in self.neighbors_ports:
+                    follower_id = node_ports[follower_port]
+                    if follower_id == self.node_id:
+                        continue
+
+                    self.sent_length[follower_id] = len(self.log)
+                    self.acked_length[follower_id] = 0
+
+                    self.replicate_log(follower_id=follower_id)
 
         elif term > self.current_term:
             self.current_term = term
@@ -165,12 +194,31 @@ class Raft:
                     logging.info(
                         f"Send heartbeat message to node {follower_id} with port {follower_port}"
                     )
-                    message = ("log_request", self.node_id, self.current_term)
-                    self.send_message(f"{message}", follower_port)
+                    self.replicate_log(follower_id=follower_id)
 
             time.sleep(self.heartbeat_duration)
 
-    def receive_log_request(self, leader_id, term):
+    def replicate_log(self, follower_id):
+        prefix_len = self.sent_length[follower_id]
+        suffix = self.log[prefix_len:]
+        prefix_term = 0
+        if prefix_len > 0:
+            prefix_term = self.log[prefix_len - 1][1]
+
+        message = (
+            "log_request",
+            self.node_id,
+            self.current_term,
+            prefix_len,
+            prefix_term,
+            self.commit_length,
+            suffix,
+        )
+        self.send_message(f"{message}", self.neighbors_ports[follower_id - 1])
+
+    def receive_log_request(
+        self, leader_id, term, prefix_len, prefix_term, leader_commit, suffix
+    ):
         self.is_stop_timer = True
         self.election_timer.cancel()
         thread = threading.Thread(target=self.start_election_timer)
@@ -213,10 +261,12 @@ class Raft:
             if eval_message[0] == "vote_request":
                 c_id = eval_message[1]
                 c_term = eval_message[2]
+                c_log_length = eval_message[3]
+                c_log_term = eval_message[4]
 
                 logging.info(f"node{c_id} sends a vote_request")
                 logging.info("vote procedure is starting...")
-                self.receive_vote_request(c_id, c_term)
+                self.receive_vote_request(c_id, c_term, c_log_length, c_log_term)
 
             elif eval_message[0] == "vote_response":
                 voter_id = eval_message[1]
@@ -228,10 +278,16 @@ class Raft:
             elif eval_message[0] == "log_request":
                 leader_id = eval_message[1]
                 term = eval_message[2]
+                prefix_len = eval_message[3]
+                prefix_term = eval_message[4]
+                leader_commit = eval_message[5]
+                suffix = eval_message[6]
 
                 logging.info(f"node{leader_id} sends a log_request")
                 logging.info("Receive log is starting...")
-                self.receive_log_request(leader_id, term)
+                self.receive_log_request(
+                    leader_id, term, prefix_len, prefix_term, leader_commit, suffix
+                )
 
             elif eval_message[0] == "log_response":
                 follower_id = eval_message[1]
